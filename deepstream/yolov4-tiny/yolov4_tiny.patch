@@ -1,0 +1,141 @@
+diff --git a/nvdsinfer_custom_impl_Yolo/Makefile b/nvdsinfer_custom_impl_Yolo/Makefile
+index 8b85b86..3511cd5 100644
+--- a/nvdsinfer_custom_impl_Yolo/Makefile
++++ b/nvdsinfer_custom_impl_Yolo/Makefile
+@@ -20,7 +20,7 @@
+ # DEALINGS IN THE SOFTWARE.
+ ################################################################################
+ 
+-CUDA_VER?=
++CUDA_VER?=10.2
+ ifeq ($(CUDA_VER),)
+   $(error "CUDA_VER is not set")
+ endif
+diff --git a/nvdsinfer_custom_impl_Yolo/nvdsinfer_yolo_engine.cpp b/nvdsinfer_custom_impl_Yolo/nvdsinfer_yolo_engine.cpp
+index 1a70baf..29a5dca 100644
+--- a/nvdsinfer_custom_impl_Yolo/nvdsinfer_yolo_engine.cpp
++++ b/nvdsinfer_custom_impl_Yolo/nvdsinfer_yolo_engine.cpp
+@@ -47,6 +47,11 @@ static bool getYoloNetworkInfo (NetworkInfo &networkInfo, const NvDsInferContext
+             yoloType = "yolov3-tiny";
+         else
+             yoloType = "yolov3";
++    } else if (yoloCfg.find("yolov4") != std::string::npos) {
++        if (yoloCfg.find("yolov4-tiny") != std::string::npos)
++            yoloType = "yolov3-tiny";
++        else
++            yoloType = "yolov3";
+     } else {
+         std::cerr << "Yolo type is not defined from config file name:"
+                   << yoloCfg << std::endl;
+diff --git a/nvdsinfer_custom_impl_Yolo/nvdsparsebbox_Yolo.cpp b/nvdsinfer_custom_impl_Yolo/nvdsparsebbox_Yolo.cpp
+index 17f47ee..5250f87 100644
+--- a/nvdsinfer_custom_impl_Yolo/nvdsparsebbox_Yolo.cpp
++++ b/nvdsinfer_custom_impl_Yolo/nvdsparsebbox_Yolo.cpp
+@@ -44,6 +44,12 @@ extern "C" bool NvDsInferParseCustomYoloV3Tiny(
+     NvDsInferParseDetectionParams const& detectionParams,
+     std::vector<NvDsInferParseObjectInfo>& objectList);
+ 
++extern "C" bool NvDsInferParseCustomYoloV4Tiny(
++    std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
++    NvDsInferNetworkInfo const& networkInfo,
++    NvDsInferParseDetectionParams const& detectionParams,
++    std::vector<NvDsInferParseObjectInfo>& objectList);
++
+ extern "C" bool NvDsInferParseCustomYoloV2(
+     std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
+     NvDsInferNetworkInfo const& networkInfo,
+@@ -308,6 +314,24 @@ extern "C" bool NvDsInferParseCustomYoloV3Tiny(
+         kANCHORS, kMASKS);
+ }
+ 
++extern "C" bool NvDsInferParseCustomYoloV4Tiny(
++    std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
++    NvDsInferNetworkInfo const& networkInfo,
++    NvDsInferParseDetectionParams const& detectionParams,
++    std::vector<NvDsInferParseObjectInfo>& objectList)
++{
++    static const std::vector<float> kANCHORS = {
++        10, 14, 23, 27, 37, 58, 81, 82, 135, 169, 344, 319};
++    static const std::vector<std::vector<int>> kMASKS = {
++        {3, 4, 5},
++        //{0, 1, 2}}; // as per output result, select {1,2,3}
++        {1, 2, 3}};
++
++    return NvDsInferParseYoloV3 (
++        outputLayersInfo, networkInfo, detectionParams, objectList,
++        kANCHORS, kMASKS);
++}
++
+ static bool NvDsInferParseYoloV2(
+     std::vector<NvDsInferLayerInfo> const& outputLayersInfo,
+     NvDsInferNetworkInfo const& networkInfo,
+@@ -424,6 +448,7 @@ extern "C" bool NvDsInferParseCustomYoloTLT(
+ /* Check that the custom function has been defined correctly */
+ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloV3);
+ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloV3Tiny);
++CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloV4Tiny);
+ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloV2);
+ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloV2Tiny);
+ CHECK_CUSTOM_PARSE_FUNC_PROTOTYPE(NvDsInferParseCustomYoloTLT);
+diff --git a/nvdsinfer_custom_impl_Yolo/yolo.cpp b/nvdsinfer_custom_impl_Yolo/yolo.cpp
+index d90aea6..22d4f4d 100644
+--- a/nvdsinfer_custom_impl_Yolo/yolo.cpp
++++ b/nvdsinfer_custom_impl_Yolo/yolo.cpp
+@@ -271,7 +271,7 @@ NvDsInferStatus Yolo::buildYoloNetwork(
+                 int vL = std::stoi(trim(strLayers.substr(lastPos, pos - lastPos)));
+                 idxLayers.push_back (vL);
+                 lastPos = pos + 1;
+-            }
++	    }
+             if (lastPos < strLayers.length()) {
+                 std::string lastV = trim(strLayers.substr(lastPos));
+                 if (!lastV.empty()) {
+@@ -280,12 +280,34 @@ NvDsInferStatus Yolo::buildYoloNetwork(
+             }
+             assert (!idxLayers.empty());
+             std::vector<nvinfer1::ITensor*> concatInputs;
+-            for (int idxLayer : idxLayers) {
+-                if (idxLayer < 0) {
+-                    idxLayer = tensorOutputs.size() + idxLayer;
++            if ( (m_ConfigBlocks.at(i).find("groups") != m_ConfigBlocks.at(i).end()) &&
++                (m_ConfigBlocks.at(i).find("group_id") != m_ConfigBlocks.at(i).end()) )
++            {
++                assert (idxLayers.size()==1);
++                int idxLayer = idxLayers[0]<0 ? (tensorOutputs.size()+idxLayers[0]) : idxLayers[0];
++
++                int group = stoi(m_ConfigBlocks.at(i).at("groups"));
++                int gid   = stoi(m_ConfigBlocks.at(i).at("group_id"));
++
++                auto input = tensorOutputs[idxLayer];
++                auto dim   = input->getDimensions();
++
++                nvinfer1::Dims size{3, {dim.d[0]/group, dim.d[1], dim.d[2]}};
++                nvinfer1::Dims start{3, {size.d[0]*gid, 0, 0}};
++		nvinfer1::Dims stride{3, {1, 1 ,1}};
++
++                nvinfer1::ISliceLayer* slice = network.addSlice(*input, start, size, stride);
++                std::string sliceLayerName = "slice_" + std::to_string(i - 1);
++                slice->setName(sliceLayerName.c_str());
++                concatInputs.push_back (slice->getOutput(0));
++	    } else {
++               for (int idxLayer : idxLayers) {
++                    if (idxLayer < 0) {
++                        idxLayer = tensorOutputs.size() + idxLayer;
++                    }
++                    assert (idxLayer >= 0 && idxLayer < (int)tensorOutputs.size());
++                    concatInputs.push_back (tensorOutputs[idxLayer]);
+                 }
+-                assert (idxLayer >= 0 && idxLayer < (int)tensorOutputs.size());
+-                concatInputs.push_back (tensorOutputs[idxLayer]);
+             }
+             nvinfer1::IConcatenationLayer* concat =
+                 network.addConcatenation(concatInputs.data(), concatInputs.size());
+@@ -331,6 +353,8 @@ NvDsInferStatus Yolo::buildYoloNetwork(
+ 
+     if ((int)weights.size() != weightPtr)
+     {
++        std::cout << "Number of unused weights left : " << weights.size() << std::endl;
++        std::cout << "Number of unused weights left : " << weightPtr << std::endl;
+         std::cout << "Number of unused weights left : " << weights.size() - weightPtr << std::endl;
+         assert(0);
+     }
