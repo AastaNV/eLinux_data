@@ -1,0 +1,191 @@
+diff --git a/nvdsinfer_custom_impl_ssd/nvdsparsebbox_ssd.cpp b/nvdsinfer_custom_impl_ssd/nvdsparsebbox_ssd.cpp
+index b5e471d..ef4d7e8 100644
+--- a/nvdsinfer_custom_impl_ssd/nvdsparsebbox_ssd.cpp
++++ b/nvdsinfer_custom_impl_ssd/nvdsparsebbox_ssd.cpp
+@@ -29,9 +29,49 @@
+ #define MAX(a,b) ((a) > (b) ? (a) : (b))
+ #define CLIP(a,min,max) (MAX(MIN(a, max), min))
+ 
++bool intersects(NvDsInferObjectDetectionInfo &a, NvDsInferObjectDetectionInfo &b, float areaThreshold=0.0f)
++{
++  if( b.left>(a.left+a.width) || (b.left+b.width)<a.left || b.top>(a.top+a.height) || (b.top+b.height)<a.top ) // no overlap
++    return false;
++
++  float overlap = (MIN(a.left+a.width, b.left+b.width) - MAX(a.left, b.left)) * (MIN(a.top+a.height, b.top+b.height) - MAX(a.top, b.top));
++  float total   = MAX(a.width*a.height, b.width*b.height);
++  return (overlap/total) > areaThreshold;
++}
++
++bool clusterDetections(std::vector<NvDsInferObjectDetectionInfo> &objectList, NvDsInferObjectDetectionInfo &obj)
++{
++  if( objectList.size()==0 ) return true;
++
++  for( size_t m=0; m<objectList.size(); m++ )
++  {
++    if( intersects(objectList[m], obj) )
++    {
++      if( objectList[m].classId != obj.classId )
++      {
++        if( obj.detectionConfidence > objectList[m].detectionConfidence ) // replace
++        {
++          objectList.at(m) = obj;
++        }
++      }
++      else
++      {
++        float right  = MAX(objectList[m].left+objectList[m].width, obj.left+obj.width);
++        float bottom = MAX(objectList[m].top+objectList[m].height, obj.top+obj.height);
++	objectList[m].left = MIN(objectList[m].left, obj.left);
++	objectList[m].top  = MIN(objectList[m].top, obj.top);
++	objectList[m].width  = right - objectList[m].left;
++        objectList[m].height = bottom - objectList[m].top;
++        objectList[m].detectionConfidence = MAX(objectList[m].detectionConfidence, obj.detectionConfidence);
++      }
++      return false;
++    }
++  }
++  return true;
++}
++
+ /* This is a sample bounding box parsing function for the sample SSD UFF
+  * detector model provided with the TensorRT samples. */
+-
+ extern "C"
+ bool NvDsInferParseCustomSSD (std::vector<NvDsInferLayerInfo> const &outputLayersInfo,
+         NvDsInferNetworkInfo  const &networkInfo,
+@@ -45,34 +85,34 @@ bool NvDsInferParseCustomSSD (std::vector<NvDsInferLayerInfo> const &outputLayer
+         NvDsInferParseDetectionParams const &detectionParams,
+         std::vector<NvDsInferObjectDetectionInfo> &objectList)
+ {
+-  static int nmsLayerIndex = -1;
+-  static int nms1LayerIndex = -1;
++  static int confLayerIndex = -1;
++  static int bboxLayerIndex = -1;
+   static bool classMismatchWarn = false;
+-  int numClassesToParse;
+-  static const int NUM_CLASSES_SSD = 91;
++// int numClassesToParse;
++  static const int NUM_CLASSES_SSD = 9;
+ 
+-  if (nmsLayerIndex == -1) {
++  if (confLayerIndex == -1) {
+     for (unsigned int i = 0; i < outputLayersInfo.size(); i++) {
+-      if (strcmp(outputLayersInfo[i].layerName, "NMS") == 0) {
+-        nmsLayerIndex = i;
++      if (strcmp(outputLayersInfo[i].layerName, "scores") == 0) {
++        confLayerIndex = i;
+         break;
+       }
+     }
+-    if (nmsLayerIndex == -1) {
+-    std::cerr << "Could not find NMS layer buffer while parsing" << std::endl;
++    if (confLayerIndex == -1) {
++    std::cerr << "Could not find confidence layer buffer while parsing" << std::endl;
+     return false;
+     }
+   }
+ 
+-  if (nms1LayerIndex == -1) {
++  if (bboxLayerIndex == -1) {
+     for (unsigned int i = 0; i < outputLayersInfo.size(); i++) {
+-      if (strcmp(outputLayersInfo[i].layerName, "NMS_1") == 0) {
+-        nms1LayerIndex = i;
++      if (strcmp(outputLayersInfo[i].layerName, "boxes") == 0) {
++        bboxLayerIndex = i;
+         break;
+       }
+     }
+-    if (nms1LayerIndex == -1) {
+-    std::cerr << "Could not find NMS_1 layer buffer while parsing" << std::endl;
++    if (bboxLayerIndex == -1) {
++    std::cerr << "Could not find bounding box layer buffer while parsing" << std::endl;
+     return false;
+     }
+   }
+@@ -87,47 +127,54 @@ bool NvDsInferParseCustomSSD (std::vector<NvDsInferLayerInfo> const &outputLayer
+     classMismatchWarn = true;
+   }
+ 
+-  numClassesToParse = MIN (NUM_CLASSES_SSD,
+-      detectionParams.numClassesConfigured);
+ 
+-  int keepCount = *((int *) outputLayersInfo[nms1LayerIndex].buffer);
+-  float *detectionOut = (float *) outputLayersInfo[nmsLayerIndex].buffer;
++  float* conf = (float *) outputLayersInfo[confLayerIndex].buffer;
++  float* bbox = (float *) outputLayersInfo[bboxLayerIndex].buffer;
++  const uint32_t numBoxes = outputLayersInfo[bboxLayerIndex].dims.d[0];
++  const uint32_t numCoord = outputLayersInfo[bboxLayerIndex].dims.d[1];
+ 
+-  for (int i = 0; i < keepCount; ++i)
++  for( uint32_t n=0; n < numBoxes; n++ )
+   {
+-    float* det = detectionOut + i * 7;
+-    int classId = det[1];
+-
+-    if (classId >= numClassesToParse)
+-      continue;
+-
+-    float threshold = detectionParams.perClassPreclusterThreshold[classId];
+-
+-    if (det[2] < threshold)
++    uint32_t maxClass = 0;
++    float    maxScore = -1000.0f;
++
++    // class #0 in ONNX-SSD is BACKGROUND (ignored)
++    for( uint32_t m=1; m < NUM_CLASSES_SSD; m++ )
++    {
++      const float score = conf[n * NUM_CLASSES_SSD + m];
++      if( score < detectionParams.perClassPreclusterThreshold[m] )
++        continue;
++
++      if( score > maxScore )
++      {
++        maxScore = score;
++        maxClass = m;
++      }
++    }
++    float threshold = detectionParams.perClassPreclusterThreshold[maxClass];
++    // check if there was a detection
++    if( maxClass <= 0 || maxScore < threshold )
+       continue;
+ 
++    // populate a new detection entry
++    const float* coord = bbox + n * numCoord;
+     unsigned int rectx1, recty1, rectx2, recty2;
+     NvDsInferObjectDetectionInfo object;
+ 
+-    rectx1 = det[3] * networkInfo.width;
+-    recty1 = det[4] * networkInfo.height;
+-    rectx2 = det[5] * networkInfo.width;
+-    recty2 = det[6] * networkInfo.height;
+-
+-    object.classId = classId;
+-    object.detectionConfidence = det[2];
+-
+-    /* Clip object box co-ordinates to network resolution */
+-    object.left = CLIP(rectx1, 0, networkInfo.width - 1);
+-    object.top = CLIP(recty1, 0, networkInfo.height - 1);
+-    object.width = CLIP(rectx2, 0, networkInfo.width - 1) -
+-      object.left + 1;
+-    object.height = CLIP(recty2, 0, networkInfo.height - 1) -
+-      object.top + 1;
+-
+-    objectList.push_back(object);
++    rectx1 = coord[0] * networkInfo.width;
++    recty1 = coord[1] * networkInfo.height;
++    rectx2 = coord[2] * networkInfo.width;
++    recty2 = coord[3] * networkInfo.height;
++
++    object.classId = maxClass-1;
++    object.detectionConfidence = maxScore;
++    object.left   = CLIP(rectx1, 0, networkInfo.width - 1);
++    object.top    = CLIP(recty1, 0, networkInfo.height- 1);
++    object.width  = CLIP(rectx2, 0, networkInfo.width - 1) - object.left+ 1;
++    object.height = CLIP(recty2, 0, networkInfo.height- 1) - object.top + 1;
++    if( clusterDetections(objectList, object) )
++      objectList.push_back(object);
+   }
+-
+   return true;
+ }
+ 
